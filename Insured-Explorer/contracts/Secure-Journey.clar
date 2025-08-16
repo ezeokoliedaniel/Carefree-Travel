@@ -14,6 +14,8 @@
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_POLICY_NOT_ACTIVE (err u109))
 (define-constant ERR_INVALID_DATES (err u110))
+(define-constant ERR_LIST_TOO_LONG (err u111))
+(define-constant ERR_CLAIM_LIST_FULL (err u112))
 
 ;; Minimum and maximum values
 (define-constant MIN_PREMIUM u100000) ;; 0.1 STX
@@ -204,9 +206,15 @@
     (
       (current-policies (default-to (list) (get policy-ids (map-get? user-policies { user: user }))))
     )
-    (map-set user-policies
-      { user: user }
-      { policy-ids: (unwrap! (as-max-len? (append current-policies policy-id) u50) false) }
+    (match (as-max-len? (append current-policies policy-id) u50)
+      updated-list (begin
+        (map-set user-policies
+          { user: user }
+          { policy-ids: updated-list }
+        )
+        (ok true)
+      )
+      ERR_LIST_TOO_LONG
     )
   )
 )
@@ -217,9 +225,15 @@
     (
       (current-claims (default-to (list) (get claim-ids (map-get? policy-claims { policy-id: policy-id }))))
     )
-    (map-set policy-claims
-      { policy-id: policy-id }
-      { claim-ids: (unwrap! (as-max-len? (append current-claims claim-id) u10) false) }
+    (match (as-max-len? (append current-claims claim-id) u10)
+      updated-list (begin
+        (map-set policy-claims
+          { policy-id: policy-id }
+          { claim-ids: updated-list }
+        )
+        (ok true)
+      )
+      ERR_CLAIM_LIST_FULL
     )
   )
 )
