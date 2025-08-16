@@ -16,6 +16,8 @@
 (define-constant ERR_INVALID_DATES (err u110))
 (define-constant ERR_LIST_TOO_LONG (err u111))
 (define-constant ERR_CLAIM_LIST_FULL (err u112))
+(define-constant ERR_INVALID_INPUT (err u113))
+(define-constant ERR_INVALID_STRING (err u114))
 
 ;; Minimum and maximum values
 (define-constant MIN_PREMIUM u100000) ;; 0.1 STX
@@ -23,6 +25,8 @@
 (define-constant MIN_TRIP_DURATION u1) ;; 1 day
 (define-constant MAX_TRIP_DURATION u365) ;; 1 year
 (define-constant CLAIM_WINDOW u2592000) ;; 30 days in seconds
+(define-constant MAX_POLICY_ID u1000000) ;; Maximum policy ID
+(define-constant MAX_CLAIM_ID u1000000) ;; Maximum claim ID
 
 ;; Policy status constants
 (define-constant STATUS_ACTIVE u1)
@@ -142,6 +146,51 @@
 
 ;; Private Functions
 
+;; Validate coverage amount
+(define-private (validate-coverage-amount (coverage-amount uint))
+  (and (>= coverage-amount MIN_PREMIUM) (<= coverage-amount MAX_COVERAGE))
+)
+
+;; Validate policy type
+(define-private (validate-policy-type (policy-type uint))
+  (and (>= policy-type u1) (<= policy-type u3))
+)
+
+;; Validate claim type
+(define-private (validate-claim-type (claim-type uint))
+  (and (>= claim-type u1) (<= claim-type u5))
+)
+
+;; Validate policy ID
+(define-private (validate-policy-id (policy-id uint))
+  (and (> policy-id u0) (<= policy-id MAX_POLICY_ID))
+)
+
+;; Validate claim ID
+(define-private (validate-claim-id (claim-id uint))
+  (and (> claim-id u0) (<= claim-id MAX_CLAIM_ID))
+)
+
+;; Validate amount (non-zero)
+(define-private (validate-amount (amount uint))
+  (> amount u0)
+)
+
+;; Validate destination string (non-empty)
+(define-private (validate-destination (destination (string-ascii 100)))
+  (> (len destination) u0)
+)
+
+;; Validate description string (non-empty)
+(define-private (validate-description (description (string-ascii 500)))
+  (> (len description) u0)
+)
+
+;; Validate evidence hash (proper length)
+(define-private (validate-evidence-hash (evidence-hash (string-ascii 64)))
+  (and (> (len evidence-hash) u0) (<= (len evidence-hash) u64))
+)
+
 ;; Calculate premium based on coverage, duration, and policy type
 (define-private (calculate-premium (coverage uint) (duration uint) (policy-type uint))
   (let
@@ -252,42 +301,49 @@
       (policy-id (+ (var-get policy-counter) u1))
       (current-time (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_DATES))
       (trip-duration-days (/ (- trip-end trip-start) u86400))
-      (premium (calculate-premium coverage-amount trip-duration-days policy-type))
     )
-    ;; Validate inputs
-    (asserts! (and (>= policy-type u1) (<= policy-type u3)) ERR_INVALID_POLICY)
-    (asserts! (and (>= coverage-amount MIN_PREMIUM) (<= coverage-amount MAX_COVERAGE)) ERR_INVALID_AMOUNT)
-    (asserts! (>= premium MIN_PREMIUM) ERR_INVALID_AMOUNT)
+    ;; Validate all inputs
+    (asserts! (validate-coverage-amount coverage-amount) ERR_INVALID_AMOUNT)
+    (asserts! (validate-policy-type policy-type) ERR_INVALID_POLICY)
+    (asserts! (validate-destination destination) ERR_INVALID_STRING)
     (asserts! (validate-trip-dates trip-start trip-end) ERR_INVALID_DATES)
     
-    ;; Transfer premium from user to contract
-    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
-    
-    ;; Create policy
-    (map-set policies
-      { policy-id: policy-id }
-      {
-        policyholder: tx-sender,
-        premium: premium,
-        coverage-amount: coverage-amount,
-        trip-start: trip-start,
-        trip-end: trip-end,
-        destination: destination,
-        status: STATUS_ACTIVE,
-        created-at: current-time,
-        policy-type: policy-type
-      }
+    (let
+      (
+        (premium (calculate-premium coverage-amount trip-duration-days policy-type))
+      )
+      ;; Validate premium
+      (asserts! (>= premium MIN_PREMIUM) ERR_INVALID_AMOUNT)
+      
+      ;; Transfer premium from user to contract
+      (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+      
+      ;; Create policy
+      (map-set policies
+        { policy-id: policy-id }
+        {
+          policyholder: tx-sender,
+          premium: premium,
+          coverage-amount: coverage-amount,
+          trip-start: trip-start,
+          trip-end: trip-end,
+          destination: destination,
+          status: STATUS_ACTIVE,
+          created-at: current-time,
+          policy-type: policy-type
+        }
+      )
+      
+      ;; Update counters and balances
+      (var-set policy-counter policy-id)
+      (var-set total-premiums (+ (var-get total-premiums) premium))
+      (var-set contract-balance (+ (var-get contract-balance) premium))
+      
+      ;; Add policy to user's list
+      (try! (add-policy-to-user tx-sender policy-id))
+      
+      (ok policy-id)
     )
-    
-    ;; Update counters and balances
-    (var-set policy-counter policy-id)
-    (var-set total-premiums (+ (var-get total-premiums) premium))
-    (var-set contract-balance (+ (var-get contract-balance) premium))
-    
-    ;; Add policy to user's list
-    (try! (add-policy-to-user tx-sender policy-id))
-    
-    (ok policy-id)
   )
 )
 
@@ -302,38 +358,48 @@
     (
       (claim-id (+ (var-get claim-counter) u1))
       (current-time (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_CLAIM))
-      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_POLICY))
-      (max-amount (unwrap! (get-max-claim-amount policy-id claim-type) ERR_INVALID_CLAIM))
     )
-    ;; Validate claim
-    (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_UNAUTHORIZED)
-    (asserts! (is-eq (get status policy-data) STATUS_ACTIVE) ERR_POLICY_NOT_ACTIVE)
-    (asserts! (and (>= claim-type u1) (<= claim-type u5)) ERR_INVALID_CLAIM)
-    (asserts! (and (> amount u0) (<= amount max-amount)) ERR_INVALID_AMOUNT)
-    (asserts! (<= current-time (+ (get trip-end policy-data) CLAIM_WINDOW)) ERR_CLAIM_EXPIRED)
+    ;; Validate inputs
+    (asserts! (validate-policy-id policy-id) ERR_INVALID_POLICY)
+    (asserts! (validate-claim-type claim-type) ERR_INVALID_CLAIM)
+    (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+    (asserts! (validate-description description) ERR_INVALID_STRING)
+    (asserts! (validate-evidence-hash evidence-hash) ERR_INVALID_STRING)
     
-    ;; Create claim
-    (map-set claims
-      { claim-id: claim-id }
-      {
-        policy-id: policy-id,
-        claimant: tx-sender,
-        claim-type: claim-type,
-        amount: amount,
-        description: description,
-        evidence-hash: evidence-hash,
-        status: CLAIM_PENDING,
-        created-at: current-time,
-        processed-at: none,
-        processor: none
-      }
+    (let
+      (
+        (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_POLICY))
+        (max-amount (unwrap! (get-max-claim-amount policy-id claim-type) ERR_INVALID_CLAIM))
+      )
+      ;; Validate claim against policy
+      (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_UNAUTHORIZED)
+      (asserts! (is-eq (get status policy-data) STATUS_ACTIVE) ERR_POLICY_NOT_ACTIVE)
+      (asserts! (<= amount max-amount) ERR_INVALID_AMOUNT)
+      (asserts! (<= current-time (+ (get trip-end policy-data) CLAIM_WINDOW)) ERR_CLAIM_EXPIRED)
+      
+      ;; Create claim
+      (map-set claims
+        { claim-id: claim-id }
+        {
+          policy-id: policy-id,
+          claimant: tx-sender,
+          claim-type: claim-type,
+          amount: amount,
+          description: description,
+          evidence-hash: evidence-hash,
+          status: CLAIM_PENDING,
+          created-at: current-time,
+          processed-at: none,
+          processor: none
+        }
+      )
+      
+      ;; Update counter and add claim to policy
+      (var-set claim-counter claim-id)
+      (try! (add-claim-to-policy policy-id claim-id))
+      
+      (ok claim-id)
     )
-    
-    ;; Update counter and add claim to policy
-    (var-set claim-counter claim-id)
-    (try! (add-claim-to-policy policy-id claim-id))
-    
-    (ok claim-id)
   )
 )
 
@@ -342,116 +408,138 @@
   (let
     (
       (current-time (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_CLAIM))
-      (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
       (new-status (if approve CLAIM_APPROVED CLAIM_REJECTED))
     )
+    ;; Validate claim ID
+    (asserts! (validate-claim-id claim-id) ERR_INVALID_CLAIM)
+    
     ;; Check authorization
     (asserts! (or 
       (is-eq tx-sender CONTRACT_OWNER)
       (default-to false (get authorized (map-get? authorized-processors { processor: tx-sender }))))
       ERR_UNAUTHORIZED)
     
-    ;; Validate claim can be processed
-    (asserts! (is-eq (get status claim-data) CLAIM_PENDING) ERR_ALREADY_PROCESSED)
-    
-    ;; Update claim status
-    (map-set claims
-      { claim-id: claim-id }
-      (merge claim-data {
-        status: new-status,
-        processed-at: (some current-time),
-        processor: (some tx-sender)
-      })
+    (let
+      (
+        (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
+      )
+      ;; Validate claim can be processed
+      (asserts! (is-eq (get status claim-data) CLAIM_PENDING) ERR_ALREADY_PROCESSED)
+      
+      ;; Update claim status
+      (map-set claims
+        { claim-id: claim-id }
+        (merge claim-data {
+          status: new-status,
+          processed-at: (some current-time),
+          processor: (some tx-sender)
+        })
+      )
+      
+      (ok approve)
     )
-    
-    (ok approve)
   )
 )
 
 ;; Pay approved claim
 (define-public (pay-claim (claim-id uint))
-  (let
-    (
-      (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
-      (amount (get amount claim-data))
+  (begin
+    ;; Validate claim ID
+    (asserts! (validate-claim-id claim-id) ERR_INVALID_CLAIM)
+    
+    (let
+      (
+        (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
+        (amount (get amount claim-data))
+      )
+      ;; Validate claim can be paid
+      (asserts! (is-eq (get status claim-data) CLAIM_APPROVED) ERR_INVALID_CLAIM)
+      (asserts! (>= (var-get contract-balance) amount) ERR_INSUFFICIENT_FUNDS)
+      
+      ;; Transfer funds to claimant
+      (try! (as-contract (stx-transfer? amount tx-sender (get claimant claim-data))))
+      
+      ;; Update claim status and balances
+      (map-set claims
+        { claim-id: claim-id }
+        (merge claim-data { status: CLAIM_PAID })
+      )
+      
+      (var-set contract-balance (- (var-get contract-balance) amount))
+      (var-set total-claims-paid (+ (var-get total-claims-paid) amount))
+      
+      (ok amount)
     )
-    ;; Validate claim can be paid
-    (asserts! (is-eq (get status claim-data) CLAIM_APPROVED) ERR_INVALID_CLAIM)
-    (asserts! (>= (var-get contract-balance) amount) ERR_INSUFFICIENT_FUNDS)
-    
-    ;; Transfer funds to claimant
-    (try! (as-contract (stx-transfer? amount tx-sender (get claimant claim-data))))
-    
-    ;; Update claim status and balances
-    (map-set claims
-      { claim-id: claim-id }
-      (merge claim-data { status: CLAIM_PAID })
-    )
-    
-    (var-set contract-balance (- (var-get contract-balance) amount))
-    (var-set total-claims-paid (+ (var-get total-claims-paid) amount))
-    
-    (ok amount)
   )
 )
 
 ;; Automatic payout for pre-approved claim types (flight delays with verifiable data)
 (define-public (automatic-payout (claim-id uint))
-  (let
-    (
-      (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
-      (amount (get amount claim-data))
+  (begin
+    ;; Validate claim ID
+    (asserts! (validate-claim-id claim-id) ERR_INVALID_CLAIM)
+    
+    (let
+      (
+        (claim-data (unwrap! (map-get? claims { claim-id: claim-id }) ERR_INVALID_CLAIM))
+        (amount (get amount claim-data))
+      )
+      ;; Only allow automatic payout for flight delays
+      (asserts! (is-eq (get claim-type claim-data) CLAIM_FLIGHT_DELAY) ERR_UNAUTHORIZED)
+      (asserts! (is-eq (get status claim-data) CLAIM_PENDING) ERR_ALREADY_PROCESSED)
+      (asserts! (>= (var-get contract-balance) amount) ERR_INSUFFICIENT_FUNDS)
+      
+      ;; Auto-approve and pay
+      (map-set claims
+        { claim-id: claim-id }
+        (merge claim-data {
+          status: CLAIM_PAID,
+          processed-at: (some (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_CLAIM)),
+          processor: (some (as-contract tx-sender))
+        })
+      )
+      
+      ;; Transfer funds
+      (try! (as-contract (stx-transfer? amount tx-sender (get claimant claim-data))))
+      
+      ;; Update balances
+      (var-set contract-balance (- (var-get contract-balance) amount))
+      (var-set total-claims-paid (+ (var-get total-claims-paid) amount))
+      
+      (ok amount)
     )
-    ;; Only allow automatic payout for flight delays
-    (asserts! (is-eq (get claim-type claim-data) CLAIM_FLIGHT_DELAY) ERR_UNAUTHORIZED)
-    (asserts! (is-eq (get status claim-data) CLAIM_PENDING) ERR_ALREADY_PROCESSED)
-    (asserts! (>= (var-get contract-balance) amount) ERR_INSUFFICIENT_FUNDS)
-    
-    ;; Auto-approve and pay
-    (map-set claims
-      { claim-id: claim-id }
-      (merge claim-data {
-        status: CLAIM_PAID,
-        processed-at: (some (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_CLAIM)),
-        processor: (some (as-contract tx-sender))
-      })
-    )
-    
-    ;; Transfer funds
-    (try! (as-contract (stx-transfer? amount tx-sender (get claimant claim-data))))
-    
-    ;; Update balances
-    (var-set contract-balance (- (var-get contract-balance) amount))
-    (var-set total-claims-paid (+ (var-get total-claims-paid) amount))
-    
-    (ok amount)
   )
 )
 
 ;; Cancel policy (before trip starts, partial refund)
 (define-public (cancel-policy (policy-id uint))
-  (let
-    (
-      (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_POLICY))
-      (current-time (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_POLICY))
-      (refund-amount (/ (get premium policy-data) u2)) ;; 50% refund
+  (begin
+    ;; Validate policy ID
+    (asserts! (validate-policy-id policy-id) ERR_INVALID_POLICY)
+    
+    (let
+      (
+        (policy-data (unwrap! (map-get? policies { policy-id: policy-id }) ERR_INVALID_POLICY))
+        (current-time (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_POLICY))
+        (refund-amount (/ (get premium policy-data) u2)) ;; 50% refund
+      )
+      ;; Validate cancellation
+      (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_UNAUTHORIZED)
+      (asserts! (is-eq (get status policy-data) STATUS_ACTIVE) ERR_POLICY_NOT_ACTIVE)
+      (asserts! (> (get trip-start policy-data) current-time) ERR_POLICY_EXPIRED)
+      
+      ;; Update policy status
+      (map-set policies
+        { policy-id: policy-id }
+        (merge policy-data { status: STATUS_CANCELLED })
+      )
+      
+      ;; Process refund
+      (try! (as-contract (stx-transfer? refund-amount tx-sender (get policyholder policy-data))))
+      (var-set contract-balance (- (var-get contract-balance) refund-amount))
+      
+      (ok refund-amount)
     )
-    ;; Validate cancellation
-    (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_UNAUTHORIZED)
-    (asserts! (is-eq (get status policy-data) STATUS_ACTIVE) ERR_POLICY_NOT_ACTIVE)
-    (asserts! (> (get trip-start policy-data) current-time) ERR_POLICY_EXPIRED)
-    
-    ;; Update policy status
-    (map-set policies
-      { policy-id: policy-id }
-      (merge policy-data { status: STATUS_CANCELLED })
-    )
-    
-    ;; Process refund
-    (try! (as-contract (stx-transfer? refund-amount tx-sender (get policyholder policy-data))))
-    (var-set contract-balance (- (var-get contract-balance) refund-amount))
-    
-    (ok refund-amount)
   )
 )
 
@@ -459,16 +547,23 @@
 (define-public (add-funds (amount uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     (var-set contract-balance (+ (var-get contract-balance) amount))
     (ok amount)
   )
 )
 
+;; Validate principal (ensure it's not the contract itself)
+(define-private (validate-processor-principal (processor principal))
+  (not (is-eq processor (as-contract tx-sender)))
+)
+
 ;; Admin function to authorize claim processors
 (define-public (authorize-processor (processor principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (validate-processor-principal processor) ERR_INVALID_INPUT)
     (map-set authorized-processors { processor: processor } { authorized: true })
     (ok true)
   )
@@ -478,6 +573,7 @@
 (define-public (revoke-processor (processor principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (validate-processor-principal processor) ERR_INVALID_INPUT)
     (map-set authorized-processors { processor: processor } { authorized: false })
     (ok true)
   )
@@ -487,12 +583,18 @@
 
 ;; Get policy details
 (define-read-only (get-policy (policy-id uint))
-  (map-get? policies { policy-id: policy-id })
+  (if (validate-policy-id policy-id)
+    (map-get? policies { policy-id: policy-id })
+    none
+  )
 )
 
 ;; Get claim details
 (define-read-only (get-claim (claim-id uint))
-  (map-get? claims { claim-id: claim-id })
+  (if (validate-claim-id claim-id)
+    (map-get? claims { claim-id: claim-id })
+    none
+  )
 )
 
 ;; Get user's policies
@@ -502,7 +604,10 @@
 
 ;; Get policy's claims
 (define-read-only (get-policy-claims (policy-id uint))
-  (map-get? policy-claims { policy-id: policy-id })
+  (if (validate-policy-id policy-id)
+    (map-get? policy-claims { policy-id: policy-id })
+    none
+  )
 )
 
 ;; Get contract statistics
@@ -518,22 +623,25 @@
 
 ;; Get coverage details for policy type
 (define-read-only (get-coverage-multipliers (policy-type uint))
-  (map-get? coverage-multipliers { policy-type: policy-type })
+  (if (validate-policy-type policy-type)
+    (map-get? coverage-multipliers { policy-type: policy-type })
+    none
+  )
 )
 
 ;; Calculate premium for given parameters
 (define-read-only (quote-premium (coverage-amount uint) (trip-start uint) (trip-end uint) (policy-type uint))
-  (let
-    (
-      (duration-days (/ (- trip-end trip-start) u86400))
-    )
-    (if (and 
-          (validate-trip-dates trip-start trip-end)
-          (and (>= policy-type u1) (<= policy-type u3))
-          (and (>= coverage-amount MIN_PREMIUM) (<= coverage-amount MAX_COVERAGE)))
+  (if (and 
+        (validate-coverage-amount coverage-amount)
+        (validate-policy-type policy-type)
+        (validate-trip-dates trip-start trip-end))
+    (let
+      (
+        (duration-days (/ (- trip-end trip-start) u86400))
+      )
       (ok (calculate-premium coverage-amount duration-days policy-type))
-      ERR_INVALID_POLICY
     )
+    ERR_INVALID_POLICY
   )
 )
 
